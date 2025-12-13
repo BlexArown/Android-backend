@@ -1,3 +1,6 @@
 [submodule "Visual-programming"]
 	path = Visual-programming
 	url = https://github.com/BlexArown/Visual-programming.git
+[submodule "Visual-Programming"]
+	path = Visual-Programming
+	url = https://github.com/BlexArown/Visual-programming.git
