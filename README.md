@@ -22,14 +22,14 @@
 ---
 
 ## Структура репозитория
-backend-server/
-├─ android-client/ # Android-приложение (submodule)
-├─ examples/
-│ ├─ server.py # TCP-сервер на Python
-│ ├─ client.py # TCP-клиент на Python
-│ ├─ server.c # TCP-сервер на C
-│ └─ client.c # TCP-клиент на C
-└─ README.md
+backend-server/  
+├─ android-client/ # Android-приложение (submodule)  
+├─ examples/  
+│ ├─ server.py # TCP-сервер на Python  
+│ ├─ client.py # TCP-клиент на Python  
+│ ├─ server.c # TCP-сервер на C  
+│ └─ client.c # TCP-клиент на C  
+└─ README.md  
 
 ---
 
