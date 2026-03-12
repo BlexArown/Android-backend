@@ -95,9 +95,9 @@ static std::int64_t now_ms() {
 }
 
 static void update_location_from_block(LocationShared* loc, const std::string& locBlock) {
-    double lat=0, lon=0, alt=0, acc=0;
-    std::int64_t tms=0;
-    std::string provider="—";
+    double lat = 0, lon = 0, alt = 0, acc = 0;
+    std::int64_t tms = 0;
+    std::string provider = "—";
 
     bool hasLat = extract_number(locBlock, "latitude", lat);
     bool hasLon = extract_number(locBlock, "longitude", lon);
@@ -112,6 +112,54 @@ static void update_location_from_block(LocationShared* loc, const std::string& l
     if (hasAcc) loc->accuracy = acc;
     if (hasTime) loc->time_ms = tms;
     if (!provider.empty()) loc->provider = provider;
+}
+
+static void update_signal_from_cells(LocationShared* loc, const std::string& cellsBlock) {
+    std::string radio = "unknown";
+    extract_string(cellsBlock, "radio", radio);
+
+    double power = 0.0;
+    double quality = 0.0;
+    double noise = 0.0;
+    double asu = 0.0;
+
+    bool hasPower = false;
+    bool hasQuality = false;
+    bool hasNoise = false;
+    bool hasAsu = false;
+
+    // LTE
+    if (extract_number(cellsBlock, "rsrp", power)) hasPower = true;
+    if (extract_number(cellsBlock, "rsrq", quality)) hasQuality = true;
+    if (extract_number(cellsBlock, "rssnr", noise)) hasNoise = true;
+    if (extract_number(cellsBlock, "asuLevel", asu)) hasAsu = true;
+
+    // NR fallback
+    if (!hasPower && extract_number(cellsBlock, "ssRsrp", power)) hasPower = true;
+    if (!hasQuality && extract_number(cellsBlock, "ssRsrq", quality)) hasQuality = true;
+    if (!hasNoise && extract_number(cellsBlock, "ssSinr", noise)) hasNoise = true;
+
+    // GSM fallback
+    if (!hasPower && extract_number(cellsBlock, "dbm", power)) hasPower = true;
+    if (!hasNoise && extract_number(cellsBlock, "rssi", noise)) hasNoise = true;
+
+    loc->last_radio = radio;
+    loc->has_signal_power = hasPower;
+    loc->has_signal_quality = hasQuality;
+    loc->has_signal_noise = hasNoise;
+    loc->has_asu = hasAsu;
+
+    if (hasPower) loc->last_signal_power = power;
+    if (hasQuality) loc->last_signal_quality = quality;
+    if (hasNoise) loc->last_signal_noise = noise;
+    if (hasAsu) loc->last_asu = asu;
+
+    loc->push_history(
+        hasPower, power,
+        hasQuality, quality,
+        hasNoise, noise,
+        hasAsu, asu
+    );
 }
 
 void run_server(LocationShared* loc) {
@@ -136,7 +184,6 @@ void run_server(LocationShared* loc) {
 
             std::string jsonStr(static_cast<char*>(req.data()), req.size());
 
-            // log all incoming json lines
             logFile << jsonStr << "\n";
             logFile.flush();
 
@@ -161,18 +208,26 @@ void run_server(LocationShared* loc) {
                     if (!locBlock.empty()) {
                         update_location_from_block(loc, locBlock);
                     }
-                    if (!cellsBlock.empty()) loc->cells_text = cellsBlock;
-                    else loc->cells_text = "no cells";
 
-                    if (!trafficBlock.empty()) loc->traffic_text = trafficBlock;
-                    else loc->traffic_text = "no traffic";
+                    if (!cellsBlock.empty()) {
+                        loc->cells_text = cellsBlock;
+                        update_signal_from_cells(loc, cellsBlock);
+                    } else {
+                        loc->cells_text = "no cells";
+                    }
+
+                    if (!trafficBlock.empty()) {
+                        loc->traffic_text = trafficBlock;
+                    } else {
+                        loc->traffic_text = "no traffic";
+                    }
 
                     loc->status = "server: telemetry received";
                 }
             } else {
-                double lat=0, lon=0, alt=0, acc=0;
-                std::int64_t tms=0;
-                std::string provider="—";
+                double lat = 0, lon = 0, alt = 0, acc = 0;
+                std::int64_t tms = 0;
+                std::string provider = "—";
 
                 bool hasLat = extract_number(jsonStr, "latitude", lat);
                 bool hasLon = extract_number(jsonStr, "longitude", lon);
@@ -195,7 +250,6 @@ void run_server(LocationShared* loc) {
                 }
             }
 
-            // reply (REQ/REP rule)
             sock.send(zmq::buffer("OK", 2), zmq::send_flags::none);
         }
     } catch (const std::exception& e) {
