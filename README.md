@@ -311,7 +311,8 @@ CREATE TABLE telemetry_packets (
     altitude DOUBLE PRECISION,
     accuracy DOUBLE PRECISION,
     provider TEXT
-);```
+);
+```
 
 ### Таблица telemetry_cells
 
@@ -328,7 +329,8 @@ CREATE TABLE telemetry_cells (
     rssi DOUBLE PRECISION,
     sinr DOUBLE PRECISION,
     asu INTEGER
-);```
+);
+```
 
 ---
 
