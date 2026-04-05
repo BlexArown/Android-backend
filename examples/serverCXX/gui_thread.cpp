@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#include <map>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -30,7 +31,7 @@ void run_gui(LocationShared* loc) {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
 
-    GLFWwindow* window = glfwCreateWindow(1100, 800, "Backend Server: Location + Telemetry", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(1200, 850, "Backend Server: Location + Telemetry", nullptr, nullptr);
     if (window == nullptr) {
         glfwTerminate();
         std::lock_guard<std::mutex> lg(loc->mtx);
@@ -45,7 +46,7 @@ void run_gui(LocationShared* loc) {
     ImGui::CreateContext();
     ImPlot::CreateContext();
 
-    ImGuiIO& io = ImGui::GetIO(); 
+    ImGuiIO& io = ImGui::GetIO();
     (void)io;
 
     ImGui::StyleColorsDark();
@@ -74,7 +75,10 @@ void run_gui(LocationShared* loc) {
         bool hasSignalNoise = false;
         bool hasAsu = false;
 
-        std::vector<double> x, yPower, yQuality, yNoise, yAsu;
+        std::vector<double> x;
+        std::map<int, std::vector<double>> rsrpByPci;
+        std::map<int, std::vector<double>> rssiByPci;
+        std::map<int, std::vector<double>> sinrByPci;
 
         {
             std::lock_guard<std::mutex> lg(loc->mtx);
@@ -104,10 +108,9 @@ void run_gui(LocationShared* loc) {
             hasAsu = loc->has_asu;
 
             x = loc->hist_x;
-            yPower = loc->hist_signal_power;
-            yQuality = loc->hist_signal_quality;
-            yNoise = loc->hist_signal_noise;
-            yAsu = loc->hist_asu;
+            rsrpByPci = loc->hist_rsrp_by_pci;
+            rssiByPci = loc->hist_rssi_by_pci;
+            sinrByPci = loc->hist_sinr_by_pci;
         }
 
         ImGui::Begin("Location");
@@ -137,17 +140,17 @@ void run_gui(LocationShared* loc) {
         ImGui::Begin("Cells");
 
         ImGui::Text("Last radio: %s", lastRadio.c_str());
-        if (hasSignalPower)   ImGui::Text("Signal power   : %.2f", lastSignalPower);
-        else                  ImGui::Text("Signal power   : no data");
+        if (hasSignalPower)   ImGui::Text("Last RSRP/Power : %.2f", lastSignalPower);
+        else                  ImGui::Text("Last RSRP/Power : no data");
 
-        if (hasSignalQuality) ImGui::Text("Signal quality : %.2f", lastSignalQuality);
-        else                  ImGui::Text("Signal quality : no data");
+        if (hasSignalQuality) ImGui::Text("Last Quality    : %.2f", lastSignalQuality);
+        else                  ImGui::Text("Last Quality    : no data");
 
-        if (hasSignalNoise)   ImGui::Text("Signal noise   : %.2f", lastSignalNoise);
-        else                  ImGui::Text("Signal noise   : no data");
+        if (hasSignalNoise)   ImGui::Text("Last SINR/Noise : %.2f", lastSignalNoise);
+        else                  ImGui::Text("Last SINR/Noise : no data");
 
-        if (hasAsu)           ImGui::Text("ASU            : %.2f", lastAsu);
-        else                  ImGui::Text("ASU            : no data");
+        if (hasAsu)           ImGui::Text("ASU             : %.2f", lastAsu);
+        else                  ImGui::Text("ASU             : no data");
 
         ImGui::Separator();
         ImGui::TextWrapped("Cells JSON block:");
@@ -177,21 +180,36 @@ void run_gui(LocationShared* loc) {
         ImGui::Begin("Signal graphs");
 
         if (!x.empty()) {
-            if (ImPlot::BeginPlot("Signal Power / Quality / Noise", ImVec2(-1, 300))) {
-                ImPlot::SetupAxes("Sample", "Value");
-                if (!yPower.empty())
-                    ImPlot::PlotLine("Power", x.data(), yPower.data(), (int)x.size());
-                if (!yQuality.empty())
-                    ImPlot::PlotLine("Quality", x.data(), yQuality.data(), (int)x.size());
-                if (!yNoise.empty())
-                    ImPlot::PlotLine("Noise/SINR", x.data(), yNoise.data(), (int)x.size());
+            if (ImPlot::BeginPlot("RSRP by PCI", ImVec2(-1, 250))) {
+                ImPlot::SetupAxes("Sample", "RSRP");
+                for (const auto& [pci, values] : rsrpByPci) {
+                    if (!values.empty() && values.size() == x.size()) {
+                        std::string label = "PCI " + std::to_string(pci);
+                        ImPlot::PlotLine(label.c_str(), x.data(), values.data(), (int)x.size());
+                    }
+                }
                 ImPlot::EndPlot();
             }
 
-            if (ImPlot::BeginPlot("ASU", ImVec2(-1, 220))) {
-                ImPlot::SetupAxes("Sample", "ASU");
-                if (!yAsu.empty())
-                    ImPlot::PlotLine("ASU", x.data(), yAsu.data(), (int)x.size());
+            if (ImPlot::BeginPlot("RSSI by PCI", ImVec2(-1, 250))) {
+                ImPlot::SetupAxes("Sample", "RSSI");
+                for (const auto& [pci, values] : rssiByPci) {
+                    if (!values.empty() && values.size() == x.size()) {
+                        std::string label = "PCI " + std::to_string(pci);
+                        ImPlot::PlotLine(label.c_str(), x.data(), values.data(), (int)x.size());
+                    }
+                }
+                ImPlot::EndPlot();
+            }
+
+            if (ImPlot::BeginPlot("SINR by PCI", ImVec2(-1, 250))) {
+                ImPlot::SetupAxes("Sample", "SINR");
+                for (const auto& [pci, values] : sinrByPci) {
+                    if (!values.empty() && values.size() == x.size()) {
+                        std::string label = "PCI " + std::to_string(pci);
+                        ImPlot::PlotLine(label.c_str(), x.data(), values.data(), (int)x.size());
+                    }
+                }
                 ImPlot::EndPlot();
             }
         } else {

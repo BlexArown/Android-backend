@@ -180,12 +180,12 @@ app/
 └─ res/layout/  
 └─ activity_serialization.xml  
 
-- `SerializationActivity.kt` — управление процессом передачи данных (Start / Stop);  
-- `TelemetryBuilder.kt` — сбор данных Location и CellInfo, формирование DTO и JSON;  
-- `TelemetryDtos.kt` — data-классы для сериализации;  
-- `LocationActivity.kt` — получение координат устройства;  
-- `TelephonyActivity.kt` — получение данных о сотовых сетях;  
-- `activity_serialization.xml` — пользовательский интерфейс для запуска передачи.  
+- `SerializationActivity.kt` - управление процессом передачи данных (Start / Stop);  
+- `TelemetryBuilder.kt` - сбор данных Location и CellInfo, формирование DTO и JSON;  
+- `TelemetryDtos.kt` - data-классы для сериализации;  
+- `LocationActivity.kt` - получение координат устройства;  
+- `TelephonyActivity.kt` - получение данных о сотовых сетях;  
+- `activity_serialization.xml` - пользовательский интерфейс для запуска передачи.  
 
 ---
 
@@ -231,7 +231,7 @@ backend-server/
 │ └─ server_zmq.py  
 └─ README.md  
 
-- `server_zmq.py` — сервер ZeroMQ, принимающий данные от Android-клиента.
+- `server_zmq.py` - сервер ZeroMQ, принимающий данные от Android-клиента.
 
 ---
 
@@ -253,4 +253,153 @@ backend-server/
 Сервер прослушивает входящие подключения по адресу: tcp://0.0.0.0:5555  
 
 Используемый тип сокета:
-- **REP** — сервер отвечает каждому клиентскому запросу.
+- **REP** - сервер отвечает каждому клиентскому запросу.
+
+---
+
+# ПР13  
+## Backend + PostgreSQL + Визуализация сигналов
+
+---
+
+## Цель работы
+
+Доработать серверное приложение для:
+- сохранения телеметрии в базу данных PostgreSQL;
+- обработки входящих данных от Android-приложения;
+- отображения текущих параметров в GUI;
+- построения графиков уровня сигнала для нескольких сот.
+
+---
+
+## Общая архитектура
+
+[ Android-приложение ]  
+├─ сбор данных (Location + Telephony)  
+├─ формирование JSON (Telemetry)  
+└─ отправка по ZMQ (REQ)  
+
+↓ tcp://<SERVER_IP>:5555  
+
+[ C++ Backend Server ]  
+├─ ZMQ REP socket  
+├─ парсинг JSON  
+├─ обновление GUI (текущие значения)  
+├─ построение графиков (ImGui + ImPlot)  
+└─ запись в PostgreSQL  
+
+↓  
+
+[ PostgreSQL ]  
+├─ telemetry_packets  
+└─ telemetry_cells  
+
+---
+
+## Структура базы данных
+
+### Таблица telemetry_packets
+
+Хранит основные данные пакета:
+
+```sql
+CREATE TABLE telemetry_packets (
+    id SERIAL PRIMARY KEY,
+    ts_client_ms BIGINT,
+    latitude DOUBLE PRECISION,
+    longitude DOUBLE PRECISION,
+    altitude DOUBLE PRECISION,
+    accuracy DOUBLE PRECISION,
+    provider TEXT
+);```
+
+### Таблица telemetry_cells
+
+Хранит данные по каждой соте (PCI):
+
+```sql
+CREATE TABLE telemetry_cells (
+    id SERIAL PRIMARY KEY,
+    packet_id INTEGER REFERENCES telemetry_packets(id),
+    radio TEXT,
+    pci INTEGER,
+    rsrp DOUBLE PRECISION,
+    rsrq DOUBLE PRECISION,
+    rssi DOUBLE PRECISION,
+    sinr DOUBLE PRECISION,
+    asu INTEGER
+);```
+
+---
+
+## Логика работы сервера  
+  
+При получении каждого JSON-пакета:  
+	1. Парсится блок данных (location, traffic, cells);  
+	2. В таблицу telemetry_packets добавляется запись;  
+	3. Получается packet_id;  
+	4. Для каждой соты:  
+		1. извлекаются параметры (PCI, RSRP, RSSI, SINR и др.);  
+		2. создаётся запись в telemetry_cells.  
+
+---
+
+## Работа GUI  
+  
+GUI построен на Dear ImGui + ImPlot.  
+  
+### Отображаемые данные:  
+	1. текущая локация (lat, lon, alt);  
+	2. параметры сигнала;  
+	3. JSON последнего пакета;  
+	4. информация о сети.  
+  
+---
+  
+## Графики сигналов  
+  
+Реализованы графики:  
+	1. RSRP;  
+	2. RSSI;  
+	3. SINR;  
+
+---
+
+Принцип построения графиков  
+	1. при поступлении новых данных значения добавляются в массивы;  
+	2. для каждого PCI ведётся отдельная история;  
+	3. по оси X - номер измерения (Sample);  
+	4. по оси Y - уровень сигнала.  
+
+---
+
+## Поддержка нескольких сот  
+  
+Если в одном пакете приходят несколько сот:  
+
+PCI 7 → RSRP = -100  
+PCI 13 → RSRP = -89  
+  
+то:  
+	1. на графике отображаются несколько линий одновременно;  
+	2. каждая линия соответствует своему PCI;  
+	3. линии отображаются разными цветами;  
+	4. значения отображаются параллельно по одной оси X.  
+
+---
+
+## Легенда графика  
+
+	1. в легенде отображаются все обнаруженные PCI;  
+	2. каждый PCI соответствует своей линии;  
+	3. позволяет отслеживать поведение каждой соты во времени.  
+
+---
+
+## Особенности реализации
+
+	1. графики строятся в реальном времени;  
+	2. данные берутся из оперативной памяти (не из БД);  
+	3. БД используется только для хранения;  
+	4. реализована фильтрация некорректных значений (например, 2147483647);  
+	5. поддерживается работа с несколькими типами сетей (GSM, LTE, NR).  
