@@ -41,6 +41,7 @@ add_executable(server_app
     osm_math.cpp
     curl_func.cpp
     tile_manager.cpp
+    heatmap_generator.cpp
 
     imgui/imgui.cpp
     imgui/imgui_draw.cpp

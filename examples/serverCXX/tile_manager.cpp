@@ -6,7 +6,7 @@
 #include "stb_image.h"
 
 #include <filesystem>
-#include <vector>
+#include <thread>
 
 TileManager::TileManager() {
 }
@@ -30,6 +30,41 @@ std::string TileManager::make_key(int z, int x, int y) const {
     return std::to_string(z) + "/" + std::to_string(x) + "/" + std::to_string(y);
 }
 
+int TileManager::active_downloads() const {
+    std::lock_guard<std::mutex> lg(mtx);
+    return (int)downloading.size();
+}
+
+void TileManager::request_tile_async(int z, int x, int y) {
+    namespace fs = std::filesystem;
+
+    x = wrap_tile_x(x, z);
+    y = clamp_tile_y(y, z);
+
+    const std::string key = make_key(z, x, y);
+    const std::string path = make_tile_path(z, x, y);
+
+    if (fs::exists(path)) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lg(mtx);
+        if (downloading.find(key) != downloading.end()) {
+            return;
+        }
+        downloading.insert(key);
+    }
+
+    std::thread([this, z, x, y, key, path]() {
+        std::string url = make_tile_url(z, x, y);
+        download_file_with_curl(url, path);
+
+        std::lock_guard<std::mutex> lg(mtx);
+        downloading.erase(key);
+    }).detach();
+}
+
 bool TileManager::ensure_tile_file_exists(int z, int x, int y, std::string& out_path) {
     namespace fs = std::filesystem;
 
@@ -39,8 +74,10 @@ bool TileManager::ensure_tile_file_exists(int z, int x, int y, std::string& out_
         return true;
     }
 
-    std::string url = make_tile_url(z, x, y);
-    return download_file_with_curl(url, out_path);
+    // Важное изменение: GUI больше НЕ ждёт curl.
+    // Если файла нет — ставим тайл в фоновую очередь и пока возвращаем false.
+    request_tile_async(z, x, y);
+    return false;
 }
 
 bool TileManager::load_png_as_texture(const std::string& path, TileTexture& tex) {
@@ -91,12 +128,14 @@ TileTexture* TileManager::get_or_load_tile(int z, int x, int y) {
     x = wrap_tile_x(x, z);
     y = clamp_tile_y(y, z);
 
-    std::lock_guard<std::mutex> lg(mtx);
+    const std::string key = make_key(z, x, y);
 
-    std::string key = make_key(z, x, y);
-    auto it = textures.find(key);
-    if (it != textures.end()) {
-        return &it->second;
+    {
+        std::lock_guard<std::mutex> lg(mtx);
+        auto it = textures.find(key);
+        if (it != textures.end()) {
+            return &it->second;
+        }
     }
 
     std::string path;
@@ -109,6 +148,12 @@ TileTexture* TileManager::get_or_load_tile(int z, int x, int y) {
         return nullptr;
     }
 
-    textures[key] = tex;
-    return &textures[key];
+    std::lock_guard<std::mutex> lg(mtx);
+    auto [it, inserted] = textures.emplace(key, tex);
+    if (!inserted) {
+        if (tex.texture_id != 0) {
+            glDeleteTextures(1, &tex.texture_id);
+        }
+    }
+    return &it->second;
 }

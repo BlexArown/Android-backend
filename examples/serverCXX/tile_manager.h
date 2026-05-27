@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <map>
+#include <set>
 #include <mutex>
 
 #ifdef _WIN32
@@ -20,12 +21,20 @@ public:
     TileManager();
     ~TileManager();
 
+    // Быстрый вызов для GUI: если тайл уже есть на диске — грузит texture,
+    // если его нет — запускает скачивание в фоне и сразу возвращает nullptr.
     TileTexture* get_or_load_tile(int z, int x, int y);
+
+    // Можно вызывать заранее для видимых тайлов, чтобы быстрее поставить их в очередь.
+    void request_tile_async(int z, int x, int y);
+
+    int active_downloads() const;
     void clear();
 
 private:
     std::map<std::string, TileTexture> textures;
-    std::mutex mtx;
+    std::set<std::string> downloading;
+    mutable std::mutex mtx;
 
     bool ensure_tile_file_exists(int z, int x, int y, std::string& out_path);
     bool load_png_as_texture(const std::string& path, TileTexture& tex);

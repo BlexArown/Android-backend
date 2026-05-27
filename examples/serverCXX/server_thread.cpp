@@ -1,4 +1,5 @@
 #include "server_thread.h"
+#include "heatmap_generator.h"
 
 #include <zmq.hpp>
 #include <libpq-fe.h>
@@ -12,6 +13,9 @@
 #include <optional>
 #include <cstdint>
 #include <map>
+#include <cstdlib>
+#include <thread>
+#include <memory>
 
 static bool extract_number(const std::string& s, const std::string& key, double& out) {
     auto pos = s.find("\"" + key + "\"");
@@ -351,6 +355,112 @@ static bool db_ok(PGconn* conn) {
     return conn != nullptr && PQstatus(conn) == CONNECTION_OK;
 }
 
+
+static bool is_sql_not_null(PGresult* res, int row, int col) {
+    return PQgetisnull(res, row, col) == 0;
+}
+
+static double get_sql_double(PGresult* res, int row, int col, double fallback = 0.0) {
+    if (!is_sql_not_null(res, row, col)) return fallback;
+    char* text = PQgetvalue(res, row, col);
+    if (text == nullptr || text[0] == '\0') return fallback;
+    return std::atof(text);
+}
+
+static int get_sql_int(PGresult* res, int row, int col, int fallback = -1) {
+    if (!is_sql_not_null(res, row, col)) return fallback;
+    char* text = PQgetvalue(res, row, col);
+    if (text == nullptr || text[0] == '\0') return fallback;
+    return std::atoi(text);
+}
+
+static bool get_sql_optional_double(PGresult* res, int row, int col, double& out) {
+    if (!is_sql_not_null(res, row, col)) return false;
+    char* text = PQgetvalue(res, row, col);
+    if (text == nullptr || text[0] == '\0') return false;
+    out = std::atof(text);
+    return true;
+}
+
+static bool heat_valid_rsrp(double v) {
+    return v > -200.0 && v < -20.0;
+}
+
+static bool heat_valid_rsrq(double v) {
+    return v > -100.0 && v < 50.0;
+}
+
+static bool heat_valid_rssi(double v) {
+    return v > -200.0 && v < -20.0;
+}
+
+static void load_heat_points_from_db(PGconn* conn, LocationShared* loc) {
+    if (!db_ok(conn)) return;
+
+    const char* sql =
+        "SELECT "
+        "p.location_latitude, "
+        "p.location_longitude, "
+        "COALESCE(p.location_altitude, 0) AS altitude, "
+        "COALESCE(c.earfcn, c.nrarfcn, c.arfcn) AS earfcn, "
+        "c.pci, "
+        "COALESCE(c.rsrp, c.ss_rsrp, c.dbm) AS rsrp, "
+        "COALESCE(c.rsrq, c.ss_rsrq) AS rsrq, "
+        "COALESCE(c.rssi, c.dbm, c.rsrp, c.ss_rsrp) AS rssi "
+        "FROM telemetry_packets p "
+        "JOIN telemetry_cells c ON c.packet_id = p.id "
+        "WHERE p.location_latitude IS NOT NULL "
+        "AND p.location_longitude IS NOT NULL "
+        "AND COALESCE(c.earfcn, c.nrarfcn, c.arfcn) IS NOT NULL "
+        "ORDER BY p.id DESC;";
+
+    PGresult* res = PQexec(conn, sql);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        std::cerr << "load_heat_points_from_db failed: " << PQerrorMessage(conn) << std::endl;
+        PQclear(res);
+        return;
+    }
+
+    std::vector<HeatPoint> points;
+    int rows = PQntuples(res);
+    points.reserve(rows);
+
+    for (int i = 0; i < rows; ++i) {
+        HeatPoint p;
+        p.latitude = get_sql_double(res, i, 0);
+        p.longitude = get_sql_double(res, i, 1);
+        p.altitude = get_sql_double(res, i, 2, 0.0);
+        p.earfcn = get_sql_int(res, i, 3, -1);
+        p.pci = get_sql_int(res, i, 4, -1);
+
+        double v = 0.0;
+        if (get_sql_optional_double(res, i, 5, v) && heat_valid_rsrp(v)) {
+            p.has_rsrp = true;
+            p.rsrp = v;
+        }
+        if (get_sql_optional_double(res, i, 6, v) && heat_valid_rsrq(v)) {
+            p.has_rsrq = true;
+            p.rsrq = v;
+        }
+        if (get_sql_optional_double(res, i, 7, v) && heat_valid_rssi(v)) {
+            p.has_rssi = true;
+            p.rssi = v;
+        }
+
+        // Для Altitude точка полезна всегда. Для радио-критериев нужна хотя бы одна метрика.
+        if (p.has_rsrp || p.has_rsrq || p.has_rssi || p.earfcn != -1) {
+            points.push_back(p);
+        }
+    }
+
+    PQclear(res);
+
+    {
+        std::lock_guard<std::mutex> lg(loc->mtx);
+        loc->heat_points = std::move(points);
+    }
+}
+
 static const char* null_or_cstr(const std::optional<std::string>& v) {
     return v.has_value() ? v->c_str() : nullptr;
 }
@@ -572,137 +682,292 @@ static bool insert_cell(PGconn* conn, long long packetId, const std::string& cel
     return ok;
 }
 
-void run_server(LocationShared* loc) {
-    PGconn* db = nullptr;
+static void append_live_heat_points_from_telemetry(
+    LocationShared* loc,
+    const std::string& locBlock,
+    const std::string& cellsBlock
+) {
+    double lat = 0.0;
+    double lon = 0.0;
+    double alt = 0.0;
 
-    try {
+    if (!extract_number(locBlock, "latitude", lat)) return;
+    if (!extract_number(locBlock, "longitude", lon)) return;
+    extract_number(locBlock, "altitude", alt);
+
+    std::vector<HeatPoint> newPoints;
+
+    std::vector<std::string> cellObjects = split_top_level_objects(cellsBlock);
+    for (const auto& cellJson : cellObjects) {
+        HeatPoint p;
+        p.latitude = lat;
+        p.longitude = lon;
+        p.altitude = alt;
+
+        int iv = -1;
+        if (extract_int(cellJson, "earfcn", iv)) p.earfcn = iv;
+        else if (extract_int(cellJson, "nrarfcn", iv)) p.earfcn = iv;
+        else if (extract_int(cellJson, "arfcn", iv)) p.earfcn = iv;
+
+        if (extract_int(cellJson, "pci", iv)) p.pci = iv;
+
+        double v = 0.0;
+        if (extract_number(cellJson, "rsrp", v) && heat_valid_rsrp(v)) {
+            p.has_rsrp = true;
+            p.rsrp = v;
+        } else if (extract_number(cellJson, "ssRsrp", v) && heat_valid_rsrp(v)) {
+            p.has_rsrp = true;
+            p.rsrp = v;
+        } else if (extract_number(cellJson, "dbm", v) && heat_valid_rsrp(v)) {
+            p.has_rsrp = true;
+            p.rsrp = v;
+        }
+
+        if (extract_number(cellJson, "rsrq", v) && heat_valid_rsrq(v)) {
+            p.has_rsrq = true;
+            p.rsrq = v;
+        } else if (extract_number(cellJson, "ssRsrq", v) && heat_valid_rsrq(v)) {
+            p.has_rsrq = true;
+            p.rsrq = v;
+        }
+
+        if (extract_number(cellJson, "rssi", v) && heat_valid_rssi(v)) {
+            p.has_rssi = true;
+            p.rssi = v;
+        } else if (extract_number(cellJson, "dbm", v) && heat_valid_rssi(v)) {
+            p.has_rssi = true;
+            p.rssi = v;
+        } else if (p.has_rsrp) {
+            // На некоторых телефонах RSSI нет отдельным полем. Для демонстрации RSSI
+            // используем RSRP как fallback, чтобы heatmap не была пустой.
+            p.has_rssi = true;
+            p.rssi = p.rsrp;
+        }
+
+        if (p.has_rsrp || p.has_rsrq || p.has_rssi || p.earfcn != -1) {
+            newPoints.push_back(p);
+        }
+    }
+
+    // Если cells пустые, всё равно добавим точку высоты, чтобы Altitude heatmap работала.
+    if (newPoints.empty()) {
+        HeatPoint p;
+        p.latitude = lat;
+        p.longitude = lon;
+        p.altitude = alt;
+        newPoints.push_back(p);
+    }
+
+    std::lock_guard<std::mutex> lg(loc->mtx);
+    for (const HeatPoint& p : newPoints) {
+        loc->heat_points.push_back(p);
+    }
+
+    // Чтобы приложение не раздувало память при долгом приёме с телефона.
+    // Для демонстрации heatmap этого более чем достаточно.
+    const std::size_t MAX_LIVE_HEAT_POINTS = 5000;
+    if (loc->heat_points.size() > MAX_LIVE_HEAT_POINTS) {
+        loc->heat_points.erase(
+            loc->heat_points.begin(),
+            loc->heat_points.begin() + (loc->heat_points.size() - MAX_LIVE_HEAT_POINTS)
+        );
+    }
+}
+
+void run_server(LocationShared* loc) {
+    // Демо-старт: карта должна открываться даже без БД и телефона.
+    {
+        std::lock_guard<std::mutex> lg(loc->mtx);
+        loc->latitude = 55.030204;   // центр Новосибирска
+        loc->longitude = 82.920430;
+        loc->altitude = 150.0;
+        loc->provider = "demo";
+        loc->status = "demo: карта открыта на центре Новосибирска; выбери источник heatmap";
+        loc->db_status = "БД не подключалась автоматически";
+        loc->phone_status = "Приём телефона выключен";
+    }
+
+    PGconn* db = nullptr;
+    zmq::context_t ctx(1);
+    std::unique_ptr<zmq::socket_t> sock;
+    bool phoneBound = false;
+
+    const std::string endpoint = "tcp://*:5555";
+    std::ofstream logFile("location_log.jsonl", std::ios::app);
+
+    auto ensure_db = [&]() -> bool {
+        if (db_ok(db)) return true;
+
+        close_db(db);
         db = connect_db();
 
         if (!db_ok(db)) {
+            std::string err = db ? PQerrorMessage(db) : "unknown db error";
             std::lock_guard<std::mutex> lg(loc->mtx);
-            loc->status = std::string("db error: ") + PQerrorMessage(db);
-            close_db(db);
-            return;
+            loc->db_status = "Ошибка подключения к БД: " + err;
+            loc->status = "demo: БД недоступна, но OSM-карта продолжает работать";
+            return false;
         }
-
-        zmq::context_t ctx(1);
-        zmq::socket_t sock(ctx, zmq::socket_type::rep);
-
-        const std::string endpoint = "tcp://*:5555";
-        sock.bind(endpoint);
 
         {
             std::lock_guard<std::mutex> lg(loc->mtx);
-            loc->status = "server: db connected, bound " + endpoint;
+            loc->db_status = "БД подключена";
+            loc->status = "server: БД подключена";
+        }
+        return true;
+    };
+
+    while (true) {
+        bool needLoadDb = false;
+        bool needStartPhone = false;
+
+        {
+            std::lock_guard<std::mutex> lg(loc->mtx);
+            if (loc->request_load_db_points) {
+                needLoadDb = true;
+                loc->request_load_db_points = false;
+            }
+            if (loc->request_start_phone_server) {
+                needStartPhone = true;
+                loc->request_start_phone_server = false;
+            }
         }
 
-        std::ofstream logFile("location_log.jsonl", std::ios::app);
-
-        while (true) {
-            zmq::message_t req;
-            auto ok = sock.recv(req, zmq::recv_flags::none);
-            if (!ok) continue;
-
-            std::string jsonStr(static_cast<char*>(req.data()), req.size());
-
-            logFile << jsonStr << "\n";
-            logFile.flush();
-
-            std::string type;
-            extract_string(jsonStr, "type", type);
-
-            {
+        if (needLoadDb) {
+            if (ensure_db()) {
+                load_heat_points_from_db(db, loc);
                 std::lock_guard<std::mutex> lg(loc->mtx);
-                loc->last_raw_json = jsonStr;
-                loc->last_update_unix_ms = now_ms();
+                loc->db_points_loaded_once = true;
+                loc->db_status = "Точки из БД загружены: " + std::to_string(loc->heat_points.size());
+                loc->status = "server: heatmap-точки загружены из БД";
             }
+        }
 
-            if (type == "telemetry") {
-                std::string locBlock;
-                std::string cellsBlock;
-                std::string trafficBlock;
+        if (needStartPhone && !phoneBound) {
+            try {
+                sock = std::make_unique<zmq::socket_t>(ctx, zmq::socket_type::rep);
+                sock->bind(endpoint);
+                phoneBound = true;
 
-                extract_json_block(jsonStr, "location", locBlock);
-                extract_json_block(jsonStr, "cells", cellsBlock);
-                extract_json_block(jsonStr, "traffic", trafficBlock);
+                std::lock_guard<std::mutex> lg(loc->mtx);
+                loc->phone_server_running = true;
+                loc->phone_server_error = false;
+                loc->phone_status = "Приём телефона включен: " + endpoint;
+                loc->status = "server: ждём телеметрию телефона на " + endpoint;
+            } catch (const std::exception& e) {
+                std::lock_guard<std::mutex> lg(loc->mtx);
+                loc->phone_server_running = false;
+                loc->phone_server_error = true;
+                loc->phone_status = std::string("Ошибка запуска ZMQ: ") + e.what();
+                loc->status = loc->phone_status;
+            }
+        }
 
-                long long packetId = insert_packet(db, jsonStr, locBlock, trafficBlock);
+        if (phoneBound && sock) {
+            zmq::message_t req;
+            auto ok = sock->recv(req, zmq::recv_flags::dontwait);
 
-                if (packetId > 0 && !cellsBlock.empty()) {
-                    std::vector<std::string> cellObjects = split_top_level_objects(cellsBlock);
-                    for (const auto& cellJson : cellObjects) {
-                        insert_cell(db, packetId, cellJson);
-                    }
-                }
+            if (ok) {
+                std::string jsonStr(static_cast<char*>(req.data()), req.size());
+
+                logFile << jsonStr << "\n";
+                logFile.flush();
+
+                std::string type;
+                extract_string(jsonStr, "type", type);
 
                 {
                     std::lock_guard<std::mutex> lg(loc->mtx);
+                    loc->last_raw_json = jsonStr;
+                    loc->last_update_unix_ms = now_ms();
+                }
 
-                    if (!locBlock.empty()) {
-                        update_location_from_block(loc, locBlock);
-                    }
+                if (type == "telemetry") {
+                    std::string locBlock;
+                    std::string cellsBlock;
+                    std::string trafficBlock;
 
-                    if (!cellsBlock.empty()) {
-                        loc->cells_text = cellsBlock;
+                    extract_json_block(jsonStr, "location", locBlock);
+                    extract_json_block(jsonStr, "cells", cellsBlock);
+                    extract_json_block(jsonStr, "traffic", trafficBlock);
 
-                        update_last_signal_text(loc, cellsBlock);
-
-                        std::map<int, CellSample> cellsByPci = build_cells_by_pci(cellsBlock);
-                        if (!cellsByPci.empty()) {
-                            loc->push_multi_pci_history(cellsByPci);
+                    long long packetId = -1;
+                    if (db_ok(db)) {
+                        packetId = insert_packet(db, jsonStr, locBlock, trafficBlock);
+                        if (packetId > 0 && !cellsBlock.empty()) {
+                            std::vector<std::string> cellObjects = split_top_level_objects(cellsBlock);
+                            for (const auto& cellJson : cellObjects) {
+                                insert_cell(db, packetId, cellJson);
+                            }
                         }
-                    } else {
-                        loc->cells_text = "no cells";
                     }
 
-                    if (!trafficBlock.empty()) {
-                        loc->traffic_text = trafficBlock;
-                    } else {
-                        loc->traffic_text = "no traffic";
+                    {
+                        std::lock_guard<std::mutex> lg(loc->mtx);
+
+                        if (!locBlock.empty()) {
+                            update_location_from_block(loc, locBlock);
+                        }
+
+                        if (!cellsBlock.empty()) {
+                            loc->cells_text = cellsBlock;
+                            update_last_signal_text(loc, cellsBlock);
+
+                            std::map<int, CellSample> cellsByPci = build_cells_by_pci(cellsBlock);
+                            if (!cellsByPci.empty()) {
+                                loc->push_multi_pci_history(cellsByPci);
+                            }
+                        } else {
+                            loc->cells_text = "no cells";
+                        }
+
+                        if (!trafficBlock.empty()) {
+                            loc->traffic_text = trafficBlock;
+                        } else {
+                            loc->traffic_text = "no traffic";
+                        }
+
+                        if (packetId > 0) {
+                            loc->status = "server: telemetry received + saved to db";
+                        } else {
+                            loc->status = "server: telemetry received; heatmap point added without DB";
+                        }
                     }
 
-                    if (packetId > 0) {
-                        loc->status = "server: telemetry received + saved to db";
-                    } else {
-                        loc->status = "server: telemetry received, db insert failed";
+                    append_live_heat_points_from_telemetry(loc, locBlock, cellsBlock);
+                } else {
+                    double lat = 0.0;
+                    double lon = 0.0;
+                    double alt = 0.0;
+                    double acc = 0.0;
+                    std::int64_t tms = 0;
+                    std::string provider = "—";
+
+                    bool hasLat = extract_number(jsonStr, "latitude", lat);
+                    bool hasLon = extract_number(jsonStr, "longitude", lon);
+                    bool hasAlt = extract_number(jsonStr, "altitude", alt);
+                    bool hasAcc = extract_number(jsonStr, "accuracy", acc);
+                    bool hasTime = extract_int64(jsonStr, "time", tms);
+                    extract_string(jsonStr, "provider", provider);
+
+                    {
+                        std::lock_guard<std::mutex> lg(loc->mtx);
+                        if (hasLat) loc->latitude = lat;
+                        if (hasLon) loc->longitude = lon;
+                        if (hasAlt) loc->altitude = alt;
+                        if (hasAcc) loc->accuracy = acc;
+                        if (hasTime) loc->time_ms = tms;
+                        if (!provider.empty()) loc->provider = provider;
+                        loc->status = "server: location received";
                     }
                 }
-            } else {
-                double lat = 0.0;
-                double lon = 0.0;
-                double alt = 0.0;
-                double acc = 0.0;
-                std::int64_t tms = 0;
-                std::string provider = "—";
 
-                bool hasLat = extract_number(jsonStr, "latitude", lat);
-                bool hasLon = extract_number(jsonStr, "longitude", lon);
-                bool hasAlt = extract_number(jsonStr, "altitude", alt);
-                bool hasAcc = extract_number(jsonStr, "accuracy", acc);
-                bool hasTime = extract_int64(jsonStr, "time", tms);
-                extract_string(jsonStr, "provider", provider);
-
-                {
-                    std::lock_guard<std::mutex> lg(loc->mtx);
-
-                    if (hasLat) loc->latitude = lat;
-                    if (hasLon) loc->longitude = lon;
-                    if (hasAlt) loc->altitude = alt;
-                    if (hasAcc) loc->accuracy = acc;
-                    if (hasTime) loc->time_ms = tms;
-                    if (!provider.empty()) loc->provider = provider;
-
-                    loc->status = "server: location received";
-                }
+                sock->send(zmq::buffer("OK", 2), zmq::send_flags::none);
             }
+        }
 
-            sock.send(zmq::buffer("OK", 2), zmq::send_flags::none);
-        }
-    } catch (const std::exception& e) {
-        {
-            std::lock_guard<std::mutex> lg(loc->mtx);
-            loc->status = std::string("server error: ") + e.what();
-        }
-        close_db(db);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
+
+    close_db(db);
 }
