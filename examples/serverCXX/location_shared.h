@@ -26,7 +26,6 @@ struct CellSample {
 struct LocationShared {
     std::mutex mtx;
 
-    // Последняя локация
     double latitude = 55.030204;
     double longitude = 82.920430;
     double altitude = 0.0;
@@ -42,7 +41,6 @@ struct LocationShared {
     std::string cells_text = "no data";
     std::string traffic_text = "no data";
 
-    // Последние значения (для краткого текстового вывода)
     std::string last_radio = "unknown";
 
     double last_signal_power = 0.0;
@@ -55,22 +53,17 @@ struct LocationShared {
     bool has_signal_noise = false;
     bool has_asu = false;
 
-    // История графиков
     std::vector<double> hist_x;
 
-    // Для каждого PCI - свой массив значений
     std::map<int, std::vector<double>> hist_rsrp_by_pci;
     std::map<int, std::vector<double>> hist_rsrq_by_pci;
     std::map<int, std::vector<double>> hist_rssi_by_pci;
     std::map<int, std::vector<double>> hist_sinr_by_pci;
 
-    // Множество PCI, которые уже встречались
     std::set<int> known_pci;
 
-    // Heatmap точки из PostgreSQL
     std::vector<HeatPoint> heat_points;
 
-    // Управление демо-режимом / БД / телефоном
     bool request_load_db_points = false;
     bool request_start_phone_server = false;
 
