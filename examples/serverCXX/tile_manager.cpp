@@ -74,8 +74,6 @@ bool TileManager::ensure_tile_file_exists(int z, int x, int y, std::string& out_
         return true;
     }
 
-    // Важное изменение: GUI больше НЕ ждёт curl.
-    // Если файла нет — ставим тайл в фоновую очередь и пока возвращаем false.
     request_tile_async(z, x, y);
     return false;
 }
