@@ -103,8 +103,6 @@ static std::vector<VisibleTile> calc_visible_tiles(
 ) {
     std::vector<VisibleTile> tiles;
 
-    // Старый вариант грузил много лишних тайлов вокруг экрана.
-    // Этот вариант берет только реально видимую область + небольшой запас 1 тайл.
     int minTx = floor_to_int(centerTileX - plotCenterX / 256.0) - 1;
     int maxTx = floor_to_int(centerTileX + (plotW - plotCenterX) / 256.0) + 1;
 
