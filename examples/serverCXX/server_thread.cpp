@@ -447,7 +447,6 @@ static void load_heat_points_from_db(PGconn* conn, LocationShared* loc) {
             p.rssi = v;
         }
 
-        // Для Altitude точка полезна всегда. Для радио-критериев нужна хотя бы одна метрика.
         if (p.has_rsrp || p.has_rsrq || p.has_rssi || p.earfcn != -1) {
             points.push_back(p);
         }
@@ -738,8 +737,6 @@ static void append_live_heat_points_from_telemetry(
             p.has_rssi = true;
             p.rssi = v;
         } else if (p.has_rsrp) {
-            // На некоторых телефонах RSSI нет отдельным полем. Для демонстрации RSSI
-            // используем RSRP как fallback, чтобы heatmap не была пустой.
             p.has_rssi = true;
             p.rssi = p.rsrp;
         }
@@ -749,7 +746,6 @@ static void append_live_heat_points_from_telemetry(
         }
     }
 
-    // Если cells пустые, всё равно добавим точку высоты, чтобы Altitude heatmap работала.
     if (newPoints.empty()) {
         HeatPoint p;
         p.latitude = lat;
@@ -763,8 +759,6 @@ static void append_live_heat_points_from_telemetry(
         loc->heat_points.push_back(p);
     }
 
-    // Чтобы приложение не раздувало память при долгом приёме с телефона.
-    // Для демонстрации heatmap этого более чем достаточно.
     const std::size_t MAX_LIVE_HEAT_POINTS = 5000;
     if (loc->heat_points.size() > MAX_LIVE_HEAT_POINTS) {
         loc->heat_points.erase(
@@ -775,7 +769,6 @@ static void append_live_heat_points_from_telemetry(
 }
 
 void run_server(LocationShared* loc) {
-    // Демо-старт: карта должна открываться даже без БД и телефона.
     {
         std::lock_guard<std::mutex> lg(loc->mtx);
         loc->latitude = 55.030204;   // центр Новосибирска
