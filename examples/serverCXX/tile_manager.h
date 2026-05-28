@@ -21,11 +21,8 @@ public:
     TileManager();
     ~TileManager();
 
-    // Быстрый вызов для GUI: если тайл уже есть на диске — грузит texture,
-    // если его нет — запускает скачивание в фоне и сразу возвращает nullptr.
     TileTexture* get_or_load_tile(int z, int x, int y);
 
-    // Можно вызывать заранее для видимых тайлов, чтобы быстрее поставить их в очередь.
     void request_tile_async(int z, int x, int y);
 
     int active_downloads() const;
