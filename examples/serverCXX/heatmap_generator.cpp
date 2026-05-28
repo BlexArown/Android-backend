@@ -66,12 +66,10 @@ static bool point_allowed_by_filters(
     int earfcn,
     int pci
 ) {
-    // PCI фильтр применяем ко всем режимам, потому что точка heatmap приходит из конкретной соты.
     if (pci != -1 && p.pci != pci) {
         return false;
     }
 
-    // EARFCN имеет смысл только для радио-критериев.
     if (criterion != HeatCriterion::ALTITUDE) {
         if (earfcn != -1 && p.earfcn != earfcn) {
             return false;
@@ -88,8 +86,6 @@ static bool normalize_value(
     double& outRatio
 ) {
     if (criterion == HeatCriterion::RSRP) {
-        // Для демонстрации делаем диапазон чуть шире, чтобы очень слабые зоны были видны темно-синим.
-        // В легенде отмечаем, что ниже -110 dBm это No Signal / Unusable.
         if (value < -120.0) return false;
         outRatio = (value - (-120.0)) / 40.0; // -120 -> blue, -80 -> red
         outRatio = std::clamp(outRatio, 0.0, 1.0);
@@ -142,16 +138,13 @@ static Color heat_color(double ratio) {
 }
 
 static double meters_per_pixel_at_lat(double lat, int zoom) {
-    // Web Mercator approximate meters per pixel.
     return 156543.03392 * std::cos(lat * RAD) / static_cast<double>(1 << zoom);
 }
 
 static double idw_weight_from_distance(double distanceMeters, double radiusMeters, double power) {
-    // Плавно гасим влияние к краю радиуса, чтобы круги не были с резкой границей.
     double t = std::clamp(distanceMeters / radiusMeters, 0.0, 1.0);
     double smooth = 1.0 - t * t * (3.0 - 2.0 * t);
 
-    // Маленькая добавка защищает от бесконечного веса в самой точке.
     double d = std::max(distanceMeters, 1.0);
 
     if (std::abs(power - 2.0) < 0.0001) {
@@ -229,9 +222,6 @@ bool generate_heatmap_tile_png(
     std::vector<double> criterionValues;
     criterionValues.reserve(points.size());
 
-    // Новый вариант: не опрашиваем каждый пиксель по всем точкам.
-    // Вместо этого каждая измеренная точка "размазывается" кругом заданного радиуса.
-    // Это стабильнее на zoom 14/15 и не теряет heatmap в области, где точки реально есть.
     for (const HeatPoint& p : points) {
         if (!point_allowed_by_filters(p, criterion, earfcn, pci)) {
             continue;
@@ -258,7 +248,6 @@ bool generate_heatmap_tile_png(
         double localX = globalX - static_cast<double>(x * TILE_SIZE);
         double localY = globalY - static_cast<double>(y * TILE_SIZE);
 
-        // Если круг вообще не пересекает этот тайл — пропускаем.
         if (localX + radiusPx < 0.0 || localX - radiusPx >= w ||
             localY + radiusPx < 0.0 || localY - radiusPx >= h) {
             continue;
@@ -319,7 +308,6 @@ bool generate_heatmap_tile_png(
 
         Color c = heat_color(ratio);
 
-        // Чем больше рядом точек, тем плотнее overlay.
         double density = std::clamp(grid[i].sumWeight * 150.0, 0.0, 1.0);
         unsigned char alpha = static_cast<unsigned char>(std::clamp(70.0 + density * 130.0, 70.0, 200.0));
 
